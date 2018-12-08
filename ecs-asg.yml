@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  AWS CloudFormation template
+Parameters:
+  EcsClusterName:
+    Type: String
+    Description: >
+      Specifies the ECS Cluster Name with which the resources would be associated
+    Default: default
+  EcsAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Specifies the AMI ID for your container instances.
+  EcsInstanceType:
+    Type: CommaDelimitedList
+    Description: >
+      Specifies the EC2 instance type for your container instances.
+    Default: m4.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Optional - Specifies the name of an existing Amazon EC2 key pair to enable
+      SSH access to the EC2 instances in your cluster.
+    Default: ''
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      Specifies the ID of an existing VPC in which to launch your
+      container instances.
+    ConstraintDescription: |
+      VPC Id must begin with 'vpc-'
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Specifies the Comma separated list of existing VPC Subnet Ids where ECS instances will run
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >
+      Specifies the Security Group Id of an existing Security Group.
+    Default: ''
+  AsgMinSize:
+    Type: Number
+    Description: >
+      Specifies the min number of instances to launch and register to the cluster.
+    Default: '2'
+  AsgMaxSize:
+    Type: Number
+    Description: >
+      Specifies the max number of instances to launch and register to the cluster.
+    Default: '4'
+  AsgSize:
+    Type: Number
+    Description: >
+      Specifies the number of instances to launch and register to the cluster.
+    Default: '2'
+  UseLifecycleHooks:
+    Type: String
+    Default: 'false'
+    Description: >
+      Creates SNS Topic and lifecycle hooks for draining cluster instances before termination
+  TargetCPUUtilization:
+    Type: Number
+    Description: >
+      Specifies the CPU utilization target for ASG
+    Default: '60'
+  EbsVolumeSize:
+    Type: Number
+    Description: >
+      Specifies the Size in GBs, of the newly created Amazon Elastic
+      Block Store (Amazon EBS) volume
+    Default: '30'
+  EbsVolumeType:
+    Type: String
+    Description: Specifies the Type of (Amazon EBS) volume
+    Default: 'gp2'
+    AllowedValues:
+      - standard
+      - io1
+      - gp2
+      - sc1
+      - st1
+    ConstraintDescription: Must be a valid EC2 volume type.
+Conditions:
+  CreateEC2LCWithKeyPair: !Not
+    - !Equals
+      - Ref: KeyName
+      - ''
+  CreateScalingPolicy: !Not
+    - !Equals
+      - Ref: TargetCPUUtilization
+      - '0'
+
+  CreateWithHooks: !Equals
+    - !Ref UseLifecycleHooks
+    - 'true'
+Resources:
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: "ec2.amazonaws.com"
+          Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role'
+
+  EcsInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+      - !Ref EcsInstanceRole
+
+  EcsInstanceLc:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      ImageId: !Ref EcsAmiId
+      InstanceType: !Select
+        - 0
+        - !Ref EcsInstanceType
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref EcsInstanceProfile
+      KeyName: !If
+        - CreateEC2LCWithKeyPair
+        - !Ref KeyName
+        - !Ref 'AWS::NoValue'
+      SecurityGroups:
+        - !Ref SecurityGroupId
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: !Ref EbsVolumeSize
+            VolumeType: !Ref EbsVolumeType
+      UserData:
+        Fn::Base64: !Sub |
+           #!/bin/bash
+           echo ECS_CLUSTER=${EcsClusterName} >> /etc/ecs/ecs.config
+
+  EcsInstanceAsg:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchConfigurationName: !Ref EcsInstanceLc
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgSize
+      Tags:
+        - Key: Name
+          Value: !Sub 'ECS Instance - ${AWS::StackName}'
+          PropagateAtLaunch: 'true'
+        - Key: Description
+          Value: >-
+            This instance is the part of the Auto Scaling group which was
+            created through ECS Console
+          PropagateAtLaunch: 'true'
+
+  AsgScalingPolicy:
+    Condition: CreateScalingPolicy
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref EcsInstanceAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref TargetCPUUtilization
+
+  SNSLambdaRole:
+    Condition: CreateWithHooks
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "autoscaling.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+      Path: "/"
+
+  LambdaExecutionRole:
+    Condition: CreateWithHooks
+    Type: "AWS::IAM::Role"
+    Properties:
+      Policies:
+        -
+          PolicyName: "lambda-inline"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                - autoscaling:CompleteLifecycleAction
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - ecs:ListContainerInstances
+                - ecs:DescribeContainerInstances
+                - ecs:UpdateContainerInstancesState
+                - sns:Publish
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+      Path: "/"
+
+  ASGSNSTopic:
+    Condition: CreateWithHooks
+    Type: "AWS::SNS::Topic"
+
+  LambdaFunctionForASG:
+    Condition: CreateWithHooks
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Gracefully drain ECS tasks from EC2 instances before the instances are
+                   terminated by autoscaling.
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.6
+      MemorySize: 128
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          import json
+          import time
+          import boto3
+          CLUSTER = '${EcsClusterName}'
+          REGION = '${AWS::Region}'
+          ECS = boto3.client('ecs', region_name=REGION)
+          ASG = boto3.client('autoscaling', region_name=REGION)
+          SNS = boto3.client('sns', region_name=REGION)
+          def find_ecs_instance_info(instance_id):
+              paginator = ECS.get_paginator('list_container_instances')
+              for list_resp in paginator.paginate(cluster=CLUSTER):
+                  arns = list_resp['containerInstanceArns']
+                  desc_resp = ECS.describe_container_instances(cluster=CLUSTER,
+                                                               containerInstances=arns)
+                  for container_instance in desc_resp['containerInstances']:
+                      if container_instance['ec2InstanceId'] != instance_id:
+                          continue
+                      print('Found instance: id=%s, arn=%s, status=%s, runningTasksCount=%s' %
+                            (instance_id, container_instance['containerInstanceArn'],
+                             container_instance['status'], container_instance['runningTasksCount']))
+                      return (container_instance['containerInstanceArn'],
+                              container_instance['status'], container_instance['runningTasksCount'])
+              return None, None, 0
+          def instance_has_running_tasks(instance_id):
+              (instance_arn, container_status, running_tasks) = find_ecs_instance_info(instance_id)
+              if instance_arn is None:
+                  print('Could not find instance ID %s. Letting autoscaling kill the instance.' %
+                        (instance_id))
+                  return False
+              if container_status != 'DRAINING':
+                  print('Setting container instance %s (%s) to DRAINING' %
+                        (instance_id, instance_arn))
+                  ECS.update_container_instances_state(cluster=CLUSTER,
+                                                       containerInstances=[instance_arn],
+                                                       status='DRAINING')
+              return running_tasks > 0
+          def lambda_handler(event, context):
+              msg = json.loads(event['Records'][0]['Sns']['Message'])
+              if 'LifecycleTransition' not in msg.keys() or \
+                 msg['LifecycleTransition'].find('autoscaling:EC2_INSTANCE_TERMINATING') == -1:
+                  print('Exiting since the lifecycle transition is not EC2_INSTANCE_TERMINATING.')
+                  return
+              if instance_has_running_tasks(msg['EC2InstanceId']):
+                  print('Tasks are still running on instance %s; posting msg to SNS topic %s' %
+                        (msg['EC2InstanceId'], event['Records'][0]['Sns']['TopicArn']))
+                  time.sleep(5)
+                  sns_resp = SNS.publish(TopicArn=event['Records'][0]['Sns']['TopicArn'],
+                                         Message=json.dumps(msg),
+                                         Subject='Publishing SNS msg to invoke Lambda again.')
+                  print('Posted msg %s to SNS topic.' % (sns_resp['MessageId']))
+              else:
+                  print('No tasks are running on instance %s; setting lifecycle to complete' %
+                        (msg['EC2InstanceId']))
+                  ASG.complete_lifecycle_action(LifecycleHookName=msg['LifecycleHookName'],
+                                                AutoScalingGroupName=msg['AutoScalingGroupName'],
+                                                LifecycleActionResult='CONTINUE',
+                                                InstanceId=msg['EC2InstanceId'])
+
+  LambdaInvokePermission:
+    Condition: CreateWithHooks
+    Type: "AWS::Lambda::Permission"
+    Properties:
+       FunctionName: !Ref LambdaFunctionForASG
+       Action: lambda:InvokeFunction
+       Principal: "sns.amazonaws.com"
+       SourceArn: !Ref ASGSNSTopic
+
+  LambdaSubscriptionToSNSTopic:
+    Condition: CreateWithHooks
+    Type: AWS::SNS::Subscription
+    Properties:
+       Endpoint:
+          Fn::GetAtt:
+             - "LambdaFunctionForASG"
+             - "Arn"
+       Protocol: 'lambda'
+       TopicArn: !Ref ASGSNSTopic
+
+  ASGTerminateHook:
+    Condition: CreateWithHooks
+    Type: "AWS::AutoScaling::LifecycleHook"
+    Properties:
+      AutoScalingGroupName: !Ref EcsInstanceAsg
+      DefaultResult: "ABANDON"
+      HeartbeatTimeout: "900"
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+      NotificationTargetARN: !Ref ASGSNSTopic
+      RoleARN:
+        Fn::GetAtt:
+          - "SNSLambdaRole"
+          - "Arn"
+    DependsOn: "ASGSNSTopic"
+
+Outputs:
+  EcsInstanceAsgName:
+    Description: Auto Scaling Group Name for ECS Instances
+    Value: !Ref EcsInstanceAsg
